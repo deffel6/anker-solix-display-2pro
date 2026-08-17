@@ -1,4 +1,4 @@
-# Anker Solix Display
+# Anker Solix Display – Solarbank 2 Pro
 
 Echtzeit-Anzeige für Anker SOLIX Solarbank auf einem ESP32-C3 mit rundem
 240×240-Display. Solarleistung, Akkustand, Akkuleistung, Netzbezug und
@@ -34,7 +34,7 @@ Nach meiner Kenntnis ist das bislang nirgends öffentlich beschrieben.
 ESP32-C3 per USB anschließen und auf der [Installationsseite][pages] auf
 *Installieren* klicken. Läuft in Chrome oder Edge, es wird nichts installiert.
 
-[pages]: https://deffel6.github.io/anker-solix-display-beta/
+[pages]: https://deffel6.github.io/anker-solix-display-2pro/
 
 ### Aus dem Quelltext
 
@@ -195,7 +195,7 @@ Fragen, Rückmeldungen oder ein Zählermodell, das noch nicht erkannt wird:
 **esp32.display@gmail.com**
 
 Fehlerberichte gerne auch als
-[Issue](https://github.com/deffel6/anker-solix-display-beta/issues).
+[Issue](https://github.com/deffel6/anker-solix-display-2pro/issues).
 
 Das Projekt entsteht in der Freizeit und bleibt kostenlos. Wer etwas dazugeben
 möchte, schreibt einfach an dieselbe Adresse.

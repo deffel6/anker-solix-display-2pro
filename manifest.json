@@ -1,6 +1,6 @@
 {
-  "name": "Anker Solix Display BETA",
-  "version": "1.22.0",
+  "name": "Anker Solix Display – Solarbank 2 Pro",
+  "version": "2.0.0",
   "new_install_prompt_erase": true,
   "builds": [
     {
