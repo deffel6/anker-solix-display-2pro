@@ -39,7 +39,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.1.0"
+#define FW_VERSION "2.2.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -178,6 +178,7 @@ static unsigned long gUpdLast = 0;
 static bool          gUpdWanted = false;   // Pruefung angefordert
 static bool          gWdtOk     = false;   // Watchdog scharf?
 static bool          gHavePower = false;   // schon einmal Leistungen dekodiert?
+static unsigned long gDumpUntil = 0;       // bis wann alle Felder protokollieren
 
 struct WxDay { float tmax=0, tmin=0, sunH=0, cloud=0, rain=0; };
 static WxDay         gWx[2];
@@ -779,6 +780,7 @@ void handleStatus(){
   else
     updRow = "<span style='color:#4caf50'>&#9679;</span> Firmware aktuell";
   updRow += " &middot; <a style='color:#888' href='/updcheck'>jetzt pr&uuml;fen</a>";
+  updRow += " &middot; <a style='color:#888' href='/felder'>Felder protokollieren</a>";
   updRow += "<br><span style='color:#555'>l&auml;uft: " FW_VERSION;
   if(gBetaLatest.length()) updRow += ", im Installer: " + gBetaLatest;
   updRow += String(" &middot; Watchdog ") + (gWdtOk ? "scharf" : "aus") + "</span>";
@@ -1049,6 +1051,15 @@ void handleDevice(){
   server.sendHeader("Location","/"); server.send(302);
 }
 
+// Drei Minuten lang jede Nachricht vollstaendig ins Protokoll schreiben.
+// Gedacht zum Entschluesseln unbekannter Felder: waehrend der Aufzeichnung
+// notiert man, was die Anker-App im selben Moment anzeigt.
+void handleFelder(){
+  gDumpUntil = millis() + 180000;
+  Serial.println("[KARTE] Aufzeichnung laeuft, 3 Minuten");
+  server.sendHeader("Location","/"); server.send(302);
+}
+
 // Seite auf dem Display umschalten. Ohne Touch ist die Weboberflaeche der
 // einzige Schalter; die Wahl wirkt sofort.
 void handlePage(){
@@ -1171,6 +1182,7 @@ void startWebUi(){
   server.on("/device",     HTTP_GET,  handleDevice);
   server.on("/updok",      HTTP_GET,  handleUpdOk);
   server.on("/updcheck",   HTTP_GET,  handleUpdCheck);
+  server.on("/felder",     HTTP_GET,  handleFelder);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
   server.begin();
   Serial.printf("[Web] http://%s/\n",WiFi.localIP().toString().c_str());
@@ -1931,6 +1943,12 @@ static bool parseParamInfo(const String& b64){
     return false;   // keine Leistungswerte in dieser Nachricht
   }
 
+  // Auf Knopfdruck jede Nachricht vollstaendig kartieren - auch die, die
+  // sich bereits dekodieren laesst. Nur so werden die Felder sichtbar, in
+  // denen die Solarbank 2 ihre Akku- und Ausgangsleistung ablegt.
+  if(gDumpUntil && millis()<gDumpUntil)
+    printFieldMap(b, got, got>500?0:1, "Bank vollstaendig,");
+
   bool  haveSolar=false;
   float solar=0, battW=0, outW=0, str[4]={0,0,0,0};
   int   soc=-1;
@@ -1991,8 +2009,10 @@ static bool parseParamInfo(const String& b64){
     uint32_t sum=str2[0]+str2[1]+str2[2]+str2[3];
     if(sum==solar2 || solar2<=1){
       haveSolar=true;
-      solar=solar2;
-      for(int k=0;k<4;k++) str[k]=str2[k];
+      // Zehntel-Watt: gegen die App geprueft - Display zeigte 940, die App
+      // 92 W bei gleichem Zeitpunkt; Ladestand und Netzwert stimmten dabei.
+      solar=solar2/10.0f;
+      for(int k=0;k<4;k++) str[k]=str2[k]/10.0f;
       if(soc2>=0) soc=soc2;
     }
   }
@@ -2086,7 +2106,8 @@ static bool parseGridInfo(const String& b64){
   // Beim Anker Smart Meter (A17X7) stehen a8/a9 konstant auf 0, obwohl die
   // App Netzbezug zeigt - der echte Wert steckt in einem anderen Feld.
   // Feldkarte ausgeben (1x/Minute), bis die Belegung geklaert ist.
-  if(imp==0 && exp_==0) printFieldMap(b, got, 2, "Zaehler,");
+  if((imp==0 && exp_==0) || (gDumpUntil && millis()<gDumpUntil))
+    printFieldMap(b, got, 2, "Zaehler,");
   free(b);
   if(!have) return false;
 
