@@ -39,7 +39,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -175,6 +175,9 @@ static int gPage = 0;
 static int    gUpdState    = 0;    // 0=gruen 1=gelb 2=rot
 static String gBetaLatest, gStableLatest, gStableSeen;
 static unsigned long gUpdLast = 0;
+static bool          gUpdWanted = false;   // Pruefung angefordert
+static bool          gWdtOk     = false;   // Watchdog scharf?
+static bool          gHavePower = false;   // schon einmal Leistungen dekodiert?
 
 struct WxDay { float tmax=0, tmin=0, sunH=0, cloud=0, rain=0; };
 static WxDay         gWx[2];
@@ -696,6 +699,7 @@ static void applyGridScale();
 void handleSave();
 bool fetchWeather();
 static int cmpVer(const String& a, const String& b);
+static void checkUpdates();
 
 // Holt die Anlagenliste frisch von Anker. Im Normalbetrieb ist gSiteList
 // leer, weil sie sonst nur beim Einrichten gefuellt wird.
@@ -769,11 +773,15 @@ void handleStatus(){
              "<a style='color:#f0a500' href='https://deffel6.github.io/anker-solix-display/'>ansehen</a>"
              " &middot; <a style='color:#f0a500' href='/updok'>quittieren</a>";
   else if(gUpdState==1)
-    updRow = String("<span style='color:#f0a500'>&#9679;</span> Neue Beta ")
+    updRow = String("<span style='color:#f0a500'>&#9679;</span> Neue Version ")
            + gBetaLatest + " verf&uuml;gbar &ndash; "
-             "<a style='color:#f0a500' href='https://deffel6.github.io/anker-solix-display-beta/'>installieren</a>";
+             "<a style='color:#f0a500' href='https://deffel6.github.io/anker-solix-display-2pro/'>installieren</a>";
   else
     updRow = "<span style='color:#4caf50'>&#9679;</span> Firmware aktuell";
+  updRow += " &middot; <a style='color:#888' href='/updcheck'>jetzt pr&uuml;fen</a>";
+  updRow += "<br><span style='color:#555'>l&auml;uft: " FW_VERSION;
+  if(gBetaLatest.length()) updRow += ", im Installer: " + gBetaLatest;
+  updRow += String(" &middot; Watchdog ") + (gWdtOk ? "scharf" : "aus") + "</span>";
   snprintf(b,sizeof(b),
     "<!DOCTYPE html><html lang='de'><head><meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -998,6 +1006,18 @@ static void applyBrightness(){
   lcd.setBrightness(gNight?0:cfg.bright);
 }
 
+// Update-Pruefung von Hand ausloesen. Praktisch zum Testen und wenn man
+// nach einem Release nicht bis zum naechsten Sechs-Stunden-Takt warten will.
+void handleUpdCheck(){
+  // Nur vormerken, nicht hier pruefen: die Pruefung dauert Sekunden und
+  // braucht Speicher, den erst die MQTT-Verbindung freigeben muss. Beides
+  // gehoert nicht in einen Webserver-Handler - genau daran ist das Geraet
+  // eingefroren. loop() erledigt es gleich darauf.
+  gUpdWanted=true;
+  Serial.println("[UPD] Pruefung von Hand angefordert");
+  server.sendHeader("Location","/"); server.send(302);
+}
+
 // Stable-Hinweis quittieren: der rote Punkt erlischt, bis das naechste
 // Stable-Release erscheint.
 void handleUpdOk(){
@@ -1150,6 +1170,7 @@ void startWebUi(){
   server.on("/geo",        HTTP_GET,  handleGeo);
   server.on("/device",     HTTP_GET,  handleDevice);
   server.on("/updok",      HTTP_GET,  handleUpdOk);
+  server.on("/updcheck",   HTTP_GET,  handleUpdCheck);
   server.onNotFound([](){ server.sendHeader("Location","/"); server.send(302); });
   server.begin();
   Serial.printf("[Web] http://%s/\n",WiFi.localIP().toString().c_str());
@@ -1596,10 +1617,24 @@ static int rawPost(const String& path, const String& body, String& outResp) {
 // Holt einen JSON-Stringwert per Textsuche – spart den Speicher, den ein
 // DynamicJsonDocument fuer die 8 KB grosse MQTT-Antwort braeuchte.
 static String jsonStr(const String& json, const char* key) {
-  String pat=String("\"")+key+"\":\"";
+  String pat=String("\"")+key+"\"";
   int i=json.indexOf(pat);
   if(i<0) return "";
   i+=pat.length();
+  // Doppelpunkt und Leerraum ueberspringen: die Anker-API liefert kompaktes
+  // JSON ("version":"1.2.3"), eine von Hand gepflegte Datei dagegen
+  // eingerueckt ("version": "1.2.3"). Genau daran ist die Update-Pruefung
+  // gescheitert - sie las stumm einen leeren Wert.
+  auto skipWs=[&](int k){
+    while(k<(int)json.length() &&
+          (json[k]==' '||json[k]=='\t'||json[k]=='\n'||json[k]=='\r')) k++;
+    return k;
+  };
+  i=skipWs(i);
+  if(i>=(int)json.length()||json[i]!=':') return "";
+  i=skipWs(i+1);
+  if(i>=(int)json.length()||json[i]!='"') return "";
+  i++;
   int e=i;
   while(e<(int)json.length()){
     if(json[e]=='"'&&json[e-1]!='\\') break;
@@ -1964,7 +1999,11 @@ static bool parseParamInfo(const String& b64){
   if(!haveSolar){
     // Weder 3-Pro- noch 2-Pro-Felder gefunden: Feldkarte ausgeben, um die
     // Belegung per Vergleich mit der App zu entschluesseln.
-    printFieldMap(b, got, got>300?0:1, "Bank ohne Leistungsfelder,");
+    // Nur ausgeben, solange von diesem Geraet noch nie Leistungswerte kamen.
+    // Sonst meldet sich bei einer laufenden Solarbank 3 Pro jede Minute die
+    // Begleitnachricht, die gar keine Leistungen traegt.
+    if(!gHavePower)
+      printFieldMap(b, got, got>300?0:1, "Bank ohne Leistungsfelder,");
     free(b);
     return false;
   }
@@ -1993,6 +2032,7 @@ static bool parseParamInfo(const String& b64){
     gData.battery_wh = soc/100.0f*cfg.battWh;
   }
   gData.valid=true;
+  gHavePower=true;
   for(int k=0;k<4;k++) gPvStr[k]=str[k];
   integrateEnergy();
   LOGF("[PV] %.0f W = %.0f+%.0f+%.0f+%.0f | Akku %.0f W | Aus %.0f W\n",
@@ -2538,6 +2578,25 @@ static String fetchManifestVersion(const char* url){
   return v;
 }
 
+// Pruefung im laufenden Betrieb. Die MQTT-Verbindung wird dafuer getrennt:
+// ihr TLS-Zustand belegt rund 45 kB am Stueck, und genau die fehlen der
+// zweiten verschluesselten Verbindung. loop() baut MQTT gleich danach wieder
+// auf, das kostet ein paar Sekunden ohne Live-Werte - deutlich besser als
+// ein haengendes Geraet.
+static void checkUpdates();
+static void runUpdateCheck(){
+  bool wasUp = gMqtt.connected();
+  if(wasUp){
+    Serial.println("[UPD] MQTT kurz getrennt, um Speicher freizugeben");
+    gMqtt.disconnect();
+    gMqttNet.stop();
+    delay(250);      // dem Speicher Zeit geben, wieder zusammenzuwachsen
+  }
+  checkUpdates();
+  gUpdLast=millis();
+  if(wasUp) gMqttLastTry=0;      // sofortiger Neuaufbau in loop()
+}
+
 // Vergleicht die laufende Firmware mit den beiden Installern.
 //   gelb: der Beta-Installer traegt eine neuere Version als dieses Geraet
 //   rot:  ein Stable-Release, das noch nicht quittiert wurde
@@ -2545,13 +2604,26 @@ static String fetchManifestVersion(const char* url){
 // uebersprungen - ein doppelter TLS-Handshake neben MQTT war der
 // Absturzgrund der fruehen Wetterseite.
 static void checkUpdates(){
-  if(ESP.getMaxAllocHeap()<50000){
-    Serial.printf("[UPD] Pruefung uebersprungen, groesster Block %u\n",
-                  (unsigned)ESP.getMaxAllocHeap());
-    return;
+  // Das Sprite wird NICHT mehr freigegeben, um Platz zu schaffen: nach der
+  // Pruefung liess es sich nicht zuverlaessig zurueckholen, und ohne Sprite
+  // zeichnet das Display direkt aufs Panel - es flackert. Stattdessen laeuft
+  // die erste Pruefung beim Start, bevor die MQTT-Verbindung steht; dort ist
+  // reichlich Speicher frei. Im Betrieb wird nur gemessen und notfalls
+  // uebersprungen.
+  // Schwelle bewusst niedrig: der TLS-Handshake belegt nicht einen einzigen
+  // grossen Block, sondern mehrere mittlere. Gemessen hat sich MQTT direkt
+  // nach dem Trennen mit 38,9 kB groesstem Block problemlos neu verbunden -
+  // die fruehere Grenze von 40 kB hat die Pruefung deshalb immer verworfen.
+  bool tooTight = ESP.getMaxAllocHeap()<25000;
+  Serial.printf("[UPD] Speicher: frei %u, groesster Block %u%s\n",
+                (unsigned)ESP.getFreeHeap(),(unsigned)ESP.getMaxAllocHeap(),
+                tooTight?" - zu wenig, uebersprungen":"");
+  String beta, stab;
+  if(!tooTight){
+  beta = fetchManifestVersion("https://deffel6.github.io/anker-solix-display-2pro/manifest.json");
+  stab = fetchManifestVersion("https://deffel6.github.io/anker-solix-display/manifest.json");
   }
-  String beta = fetchManifestVersion("https://deffel6.github.io/anker-solix-display-beta/manifest.json");
-  String stab = fetchManifestVersion("https://deffel6.github.io/anker-solix-display/manifest.json");
+  if(tooTight) return;
   if(beta.length()) gBetaLatest  =beta;
   if(stab.length()) gStableLatest=stab;
   // Erstes gesehenes Stable-Release nur merken, nicht melden - sonst
@@ -2570,7 +2642,7 @@ static void checkUpdates(){
     gUpdState=st;
     drawDisplay();          // Punkt sofort umfaerben
   }
-  Serial.printf("[UPD] laufend %s | Beta %s | Stable %s (quittiert %s) -> %s\n",
+  Serial.printf("[UPD] laufend %s | 2Pro-Linie %s | Stable %s (quittiert %s) -> %s\n",
                 FW_VERSION, gBetaLatest.c_str(), gStableLatest.c_str(),
                 gStableSeen.c_str(),
                 st==2?"ROT":st==1?"GELB":"GRUEN");
@@ -2628,6 +2700,10 @@ void setup(){
   if(!ankerLogin()){startFixPortal();return;}
 
   gSiteId=cfg.siteId;
+  // Update-Pruefung noch vor der MQTT-Verbindung: jetzt ist der Speicher
+  // unzerstueckelt, der TLS-Handshake gelingt zuverlaessig.
+  checkUpdates();
+  gUpdLast=millis();
   if(fetchMqttCreds() && fetchDeviceInfo()) mqttConnect();
   // fetchData() entfaellt: get_scen_info liefert nur 463, die Werte
   // kommen jetzt vollstaendig ueber MQTT.
@@ -2644,9 +2720,14 @@ void setup(){
   {
     esp_task_wdt_config_t wc = {
       .timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true };
-    if(esp_task_wdt_reconfigure(&wc)!=ESP_OK) esp_task_wdt_init(&wc);
-    esp_task_wdt_add(NULL);
-    Serial.println("[SYS] Watchdog 60 s aktiv");
+    esp_err_t cfg = esp_task_wdt_reconfigure(&wc);
+    if(cfg!=ESP_OK) cfg = esp_task_wdt_init(&wc);
+    // Rueckmeldung auswerten statt blind Vollzug zu melden: nur wenn die
+    // Anmeldung geklappt hat, startet ein haengendes Geraet auch wirklich
+    // von selbst neu.
+    gWdtOk = (esp_task_wdt_add(NULL)==ESP_OK);
+    Serial.printf("[SYS] Watchdog %s (cfg=%d)\n",
+                  gWdtOk ? "scharf, 60 s" : "NICHT aktiv", (int)cfg);
   }
 }
 
@@ -2707,9 +2788,17 @@ void loop(){
   }
   // Update-Pruefung: erstmals zwei Minuten nach dem Start (dann haben sich
   // MQTT und Wetter eingeschwungen), danach alle 6 Stunden.
-  if((gUpdLast==0 && now>=120000) || (gUpdLast && now-gUpdLast>=21600000UL)){
-    gUpdLast=now;
-    checkUpdates();
+  if(gUpdWanted || (gUpdLast && now-gUpdLast>=21600000UL)){
+    gUpdWanted=false;
+    runUpdateCheck();
+  }
+  // Sicherheitsnetz gegen Flackern: fehlt das Sprite - etwa weil einmal zu
+  // wenig Speicher am Stueck frei war -, alle 10 s neu versuchen.
+  static unsigned long lastSpr=0;
+  if(spr.getBuffer()==nullptr && now-lastSpr>=10000){
+    lastSpr=now;
+    spr.setColorDepth(8);
+    if(spr.createSprite(240,240)) Serial.println("[SPR] wieder angelegt");
   }
   // Nachtabschaltung: einmal pro Minute pruefen reicht. Bei Aenderungen
   // ueber die Weboberflaeche greift applyBrightness() dort sofort.
