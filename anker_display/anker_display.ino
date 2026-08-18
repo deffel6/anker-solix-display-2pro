@@ -23,6 +23,13 @@
 ║    ac      Akkuleistung (W), negativ = Entladen             ║
 ║    ad      Ausgangsleistung (W) = ab + ac                   ║
 ║    c6..c9  die vier MPPT-Strings, Summe = ab                ║
+║  Belegte Felder – Solarbank 2 Pro A17C1 (u32 statt float):  ║
+║    ab      Solarleistung gesamt (Zehntel-Watt)              ║
+║    ca..cd  die vier Strings, Summe = ab                     ║
+║    ad      Ladestand in %                                   ║
+║    b0      Akku-Ladeleistung, HUNDERTSTEL-Watt              ║
+║    c4      Hauslast (Zehntel-Watt), = ac + bc               ║
+║                                                             ║
 ║  Netzzaehler SHEM3 – Werte als u32, nicht float:            ║
 ║    a8      Netzbezug, a9 Einspeisung (Hundertstel-Watt)     ║
 ║                                                             ║
@@ -39,7 +46,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.3.0"
+#define FW_VERSION "2.4.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -245,6 +252,9 @@ static unsigned long gLastEnergySave = 0;
 static WiFiClientSecure gMqttNet;
 static PubSubClient     gMqtt(gMqttNet);
 static float            gOutW          = 0;   // 0xad: Ausgang der Solarbank
+// Hauslast, wie die Solarbank 2 Pro sie in 0xc4 meldet. Der Netzzaehler ist
+// genauer und behaelt den Vorrang; dieser Wert springt ein, wenn keiner da ist.
+static float            gHouseW2       = -1;  // <0 = kein Wert empfangen
 static uint32_t         gMqttRxCount   = 0;
 static unsigned long    gMqttLastTry   = 0;
 static unsigned long    gMqttConnectedAt = 0; // Startpunkt der Lauschphase
@@ -1998,8 +2008,8 @@ static bool parseParamInfo(const String& b64){
   int   soc=-1;
   // Zweiter Satz fuer die Solarbank 2 (A17C1): dort sind die Leistungen
   // u32 statt float, die Strings liegen in ca..cd, der Ladestand in ad.
-  bool     haveSolar2=false;
-  uint32_t solar2=0, str2[4]={0,0,0,0};
+  bool     haveSolar2=false, haveBatt2=false, haveHouse2=false;
+  uint32_t solar2=0, str2[4]={0,0,0,0}, battW2=0, house2=0;
   int      soc2=-1;
   String ints;                      // Kandidatenliste fuer den Ladestand
   size_t i=9;                       // 9 Byte Rahmen, dann Felder
@@ -2023,6 +2033,13 @@ static bool parseParamInfo(const String& b64){
       uint32_t v; memcpy(&v,d+1,4);
       switch(tag){
         case 0xab: solar2=v; haveSolar2=true; break;
+        // b0 = Ladeleistung, c4 = Hauslast. Gegen die App geprueft (18.08.):
+        // b0=6700 bei 66 W Ladeleistung, c4=3350 bei 342 W Hauslast - also
+        // Hundertstel- bzw. Zehntel-Watt. Dass b0 hier genau ab*10 ergibt,
+        // liegt nur daran, dass die ganze Solarleistung in den Akku ging;
+        // eine Stunde zuvor stand b0 bei 120 W Solarleistung auf 0.
+        case 0xb0: battW2=v; haveBatt2=true; break;
+        case 0xc4: house2=v; haveHouse2=true; break;
         case 0xca: str2[0]=v; break;
         case 0xcb: str2[1]=v; break;
         case 0xcc: str2[2]=v; break;
@@ -2047,8 +2064,8 @@ static bool parseParamInfo(const String& b64){
   // Solarbank-2-Werte in die gemeinsamen Variablen uebernehmen. Nur wenn die
   // Summe der Strings zum Gesamtwert passt - das war in allen mitgelesenen
   // Karten der Fall und schuetzt vor einer Fehldeutung des Feldes ab.
-  // Akku- und Ausgangsleistung der Solarbank 2 sind noch nicht dekodiert
-  // (sie liegen im kleinen Nachrichtenteil); bis dahin bleiben sie 0.
+  // Die Ausgangsleistung der Solarbank 2 ist noch nicht dekodiert und bleibt
+  // 0; das Entladen ebenso, siehe unten.
   if(!haveSolar && haveSolar2){
     uint32_t sum=str2[0]+str2[1]+str2[2]+str2[3];
     if(sum==solar2 || solar2<=1){
@@ -2058,6 +2075,10 @@ static bool parseParamInfo(const String& b64){
       solar=solar2/10.0f;
       for(int k=0;k<4;k++) str[k]=str2[k]/10.0f;
       if(soc2>=0) soc=soc2;
+      // b0 zaehlt in Hundertstel-Watt und kennt nur das Laden. Wo das
+      // Entladen steht, ist offen - dafuer fehlt noch ein Log vom Abend.
+      if(haveBatt2) battW=battW2/100.0f;
+      if(haveHouse2) gHouseW2=house2/10.0f;
     }
   }
   if(!haveSolar){
@@ -2095,12 +2116,16 @@ static bool parseParamInfo(const String& b64){
     gData.battery_pct= soc;
     gData.battery_wh = soc/100.0f*cfg.battWh;
   }
+  // Ohne Netzzaehler war die Hauslast bisher gar nicht bekannt. Mit Zaehler
+  // bleibt dessen Rechnung stehen: sie ist genauer und erfasst auch Verbrauch,
+  // den die Solarbank nicht sieht.
+  if(gHouseW2>=0 && gGridSn.isEmpty()) gData.home_w=gHouseW2;
   gData.valid=true;
   gHavePower=true;
   for(int k=0;k<4;k++) gPvStr[k]=str[k];
   integrateEnergy();
-  LOGF("[PV] %.0f W = %.0f+%.0f+%.0f+%.0f | Akku %.0f W | Aus %.0f W\n",
-                solar,str[0],str[1],str[2],str[3],battW,outW);
+  LOGF("[PV] %.0f W = %.0f+%.0f+%.0f+%.0f | Akku %.0f W | Aus %.0f W | Haus %.0f W\n",
+                solar,str[0],str[1],str[2],str[3],battW,outW,gData.home_w);
   LOGF("[INT] %s\n",ints.c_str());
   return true;
 }
