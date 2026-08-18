@@ -39,7 +39,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.3.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -1850,10 +1850,12 @@ static void parsePackBlock(const uint8_t* d, uint8_t len){
 // Feldkarte einer unbekannten Nachricht ausgeben, hoechstens einmal pro
 // Minute je Kanal: 0 = Bank grosse Nachricht, 1 = Bank kleine, 2 = Zaehler.
 // Daraus laesst sich die Feldbelegung im Vergleich mit der App ablesen.
-static void printFieldMap(const uint8_t* b, size_t got, int chan, const char* label){
+// force uebergeht die Drossel: der Knopf "Felder protokollieren" verspricht
+// jede Nachricht, die Drossel hatte ihn bisher auf 1x/Minute begrenzt.
+static void printFieldMap(const uint8_t* b, size_t got, int chan, const char* label, bool force=false){
   static unsigned long last[3]={0,0,0};
   if(chan<0||chan>2) chan=2;
-  if(last[chan] && millis()-last[chan]<60000) return;
+  if(!force && last[chan] && millis()-last[chan]<60000) return;
   last[chan]=millis();
   String map = String(label)+" typ="+String(b[7],HEX)+String(b[8],HEX)
              + " len="+String((unsigned)got)+"\n";
@@ -1885,6 +1887,36 @@ static void printFieldMap(const uint8_t* b, size_t got, int chan, const char* la
   }
   Serial.println("[KARTE]");
   printLong("KARTE",map);
+}
+
+// Alle Zahlenfelder einer Nachricht in einer Zeile, und zwar bei jeder
+// Nachricht: Akku- und Ausgangsleistung der Solarbank 2 Pro sind noch nicht
+// gefunden, und erst die Verlaufskurve im Vergleich mit der App (laden,
+// entladen, Ausgang an) verraet, welches Feld sie traegt. Kommt fuer die
+// grosse wie die kleine Haelfte des Nachrichtenpaars; Strings bleiben
+// aussen vor. Wieder ausbauen, sobald die Felder dekodiert sind.
+static void printNumFields(const uint8_t* b, size_t got){
+  String line = "typ=" + String(b[7],HEX) + String(b[8],HEX)
+              + " len=" + String((unsigned)got) + "  ";
+  size_t j=9;
+  while(j+1<got){
+    uint8_t tag=b[j], ln=b[j+1];
+    if(j+2+(size_t)ln>got) break;
+    const uint8_t* e=b+j+2;
+    uint8_t ty = ln?e[0]:0;
+    char t[24]; t[0]=0;
+    if(ln==5 && ty==0x03){ uint32_t v; memcpy(&v,e+1,4);
+      snprintf(t,sizeof(t),"%02x=%lu ",tag,(unsigned long)v); }
+    else if(ln==5 && ty==0x05){ float v; memcpy(&v,e+1,4);
+      snprintf(t,sizeof(t),"%02x=%.1f ",tag,v); }
+    else if(ln==3 && ty==0x02){ int16_t v; memcpy(&v,e+1,2);
+      snprintf(t,sizeof(t),"%02x=%d ",tag,(int)v); }
+    else if(ln==2 && ty==0x01)
+      snprintf(t,sizeof(t),"%02x=%u ",tag,e[1]);
+    line += t;
+    j+=2+ln;
+  }
+  printLong("SB2", line);
 }
 
 // Dekodiert die param_info-Nutzlast und fuellt gData.
@@ -1922,6 +1954,11 @@ static bool parseParamInfo(const String& b64){
     // Aufbau der Nachricht mitschreiben. Nur so laesst sich unterscheiden, ob
     // weitere Packbloecke gar nicht ankommen oder ob der Filter sie uebergeht.
     String map = "len=" + String((unsigned)got) + "  ";
+    // a2 und a3 sind Bloecke der Kopfstation, Aufbau unbekannt - dort
+    // koennte deren Lade- und Ausgangsleistung stehen. Einmal pro Minute
+    // als Hex mitschreiben, bis die Belegung geklaert ist.
+    static unsigned long lastHead=0;
+    bool dumpHead = !lastHead || millis()-lastHead>=60000;
     size_t i=9;
     bool desync=false;
     while(i+1<got){
@@ -1933,6 +1970,10 @@ static bool parseParamInfo(const String& b64){
       // a4 aufwaerts sind die Packbloecke, erkennbar am Typ 04 und der Laenge
       if(tag>=0xa4 && ln>32 && ty==0x04)
         parsePackBlock(b+i+3, ln-1);
+      if(dumpHead && (tag==0xa2||tag==0xa3) && ty==0x04 && ln>1){
+        lastHead=millis();
+        LOGF("[0500-%02x] %s\n", tag, bytesToHex(b+i+3,ln-1).c_str());
+      }
       i+=2+ln;
     }
     if(desync) map += "<< ABBRUCH: Laenge passt nicht";
@@ -1943,11 +1984,14 @@ static bool parseParamInfo(const String& b64){
     return false;   // keine Leistungswerte in dieser Nachricht
   }
 
+  // Zahlenfelder jeder Nachricht mitschreiben, siehe printNumFields.
+  printNumFields(b, got);
+
   // Auf Knopfdruck jede Nachricht vollstaendig kartieren - auch die, die
   // sich bereits dekodieren laesst. Nur so werden die Felder sichtbar, in
   // denen die Solarbank 2 ihre Akku- und Ausgangsleistung ablegt.
   if(gDumpUntil && millis()<gDumpUntil)
-    printFieldMap(b, got, got>500?0:1, "Bank vollstaendig,");
+    printFieldMap(b, got, got>500?0:1, "Bank vollstaendig,", true);
 
   bool  haveSolar=false;
   float solar=0, battW=0, outW=0, str[4]={0,0,0,0};
@@ -2106,8 +2150,9 @@ static bool parseGridInfo(const String& b64){
   // Beim Anker Smart Meter (A17X7) stehen a8/a9 konstant auf 0, obwohl die
   // App Netzbezug zeigt - der echte Wert steckt in einem anderen Feld.
   // Feldkarte ausgeben (1x/Minute), bis die Belegung geklaert ist.
-  if((imp==0 && exp_==0) || (gDumpUntil && millis()<gDumpUntil))
-    printFieldMap(b, got, 2, "Zaehler,");
+  bool dumpAll = gDumpUntil && millis()<gDumpUntil;
+  if((imp==0 && exp_==0) || dumpAll)
+    printFieldMap(b, got, 2, "Zaehler,", dumpAll);
   free(b);
   if(!have) return false;
 
