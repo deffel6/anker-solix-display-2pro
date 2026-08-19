@@ -46,7 +46,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.4.0"
+#define FW_VERSION "2.5.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -169,6 +169,12 @@ static AnkerData gData;
 // Weboberflaeche umgeschaltet; der Stand ueberdauert Neustarts bewusst nicht.
 static int gPage = 0;
 #define PAGES 2
+
+// Die Wetterseite ist ein kurzer Blick, keine Dauereinstellung: 10 s nach dem
+// Umschalten geht die Anzeige von selbst zurueck auf die Messwerte. gPageSince
+// haelt fest, wann umgeschaltet wurde.
+static unsigned long gPageSince = 0;
+#define WEATHER_SHOW_MS 10000UL
 
 // ── Wettervorhersage ────────────────────────────────────────────────────────
 // Quelle: open-meteo.com - kostenlos, ohne Anmeldung und ohne Schluessel.
@@ -579,9 +585,9 @@ const char HTML_PAGE[] PROGMEM = R"HTML(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Anker Display Setup</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
+*{box-sizing:border-box;margin:0;padding:0}html{font-size:18px}
 body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#eee;display:flex;justify-content:center;padding:20px}
-.card{background:#1a1a1a;border-radius:16px;padding:28px;width:100%;max-width:420px;box-shadow:0 4px 24px #0008}
+.card{background:#1a1a1a;border-radius:16px;padding:28px;width:100%;max-width:470px;box-shadow:0 4px 24px #0008}
 h1{font-size:1.4rem;margin-bottom:6px;color:#fff}.sub{color:#888;font-size:.85rem;margin-bottom:24px}
 .section{background:#111;border-radius:10px;padding:16px;margin-bottom:16px}
 .section h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:#f0a500;margin-bottom:12px}
@@ -619,9 +625,9 @@ const char HTML_PAGE_FIX[] PROGMEM = R"HTML(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Anker Login korrigieren</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
+*{box-sizing:border-box;margin:0;padding:0}html{font-size:18px}
 body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#eee;display:flex;justify-content:center;padding:20px}
-.card{background:#1a1a1a;border-radius:16px;padding:28px;width:100%;max-width:420px;box-shadow:0 4px 24px #0008}
+.card{background:#1a1a1a;border-radius:16px;padding:28px;width:100%;max-width:470px;box-shadow:0 4px 24px #0008}
 h1{font-size:1.4rem;margin-bottom:6px;color:#fff}.sub{color:#f66;font-size:.85rem;margin-bottom:24px}
 .section{background:#111;border-radius:10px;padding:16px;margin-bottom:16px}
 .section h2{font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:#f0a500;margin-bottom:12px}
@@ -662,9 +668,9 @@ String buildSiteSelectPage() {
   String p = F("<!DOCTYPE html><html lang='de'><head>"
     "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Anlage waehlen</title><style>"
-    "*{box-sizing:border-box;margin:0;padding:0}"
+    "*{box-sizing:border-box;margin:0;padding:0}html{font-size:18px}"
     "body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#eee;display:flex;justify-content:center;padding:20px}"
-    ".card{background:#1a1a1a;border-radius:16px;padding:28px;width:100%;max-width:420px;box-shadow:0 4px 24px #0008}"
+    ".card{background:#1a1a1a;border-radius:16px;padding:28px;width:100%;max-width:470px;box-shadow:0 4px 24px #0008}"
     "h1{font-size:1.4rem;margin-bottom:6px;color:#fff}.sub{color:#888;font-size:.85rem;margin-bottom:24px}"
     ".site-btn{display:block;width:100%;padding:16px;background:#111;border:1px solid #2a2a3a;"
     "border-radius:12px;color:#fff;text-decoration:none;margin-bottom:12px;text-align:left;"
@@ -798,10 +804,10 @@ void handleStatus(){
     "<!DOCTYPE html><html lang='de'><head><meta charset='UTF-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>%s &ndash; Anker Display</title><style>"
-    "*{box-sizing:border-box;margin:0;padding:0}"
+    "*{box-sizing:border-box;margin:0;padding:0}html{font-size:18px}"
     "body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#eee;"
     "display:flex;justify-content:center;padding:20px}"
-    ".card{background:#1a1a1a;border-radius:16px;padding:26px;width:100%%;max-width:420px}"
+    ".card{background:#1a1a1a;border-radius:16px;padding:26px;width:100%%;max-width:470px}"
     "h1{font-size:1.3rem;margin-bottom:2px}.sub{color:#888;font-size:.85rem;margin-bottom:22px}"
     "table{width:100%%;border-collapse:collapse;margin-bottom:22px}"
     "td{padding:9px 0;border-bottom:1px solid #262626;font-size:.95rem}"
@@ -861,7 +867,8 @@ void handleStatus(){
     "<p style='color:#888;font-size:.8rem;margin-bottom:12px'>"
     "Anzeige auf dem Display: "
     "<a style='color:%s' href='/page?v=0'>Messwerte</a> &middot; "
-    "<a style='color:%s' href='/page?v=1'>Wetter</a></p>"
+    "<a style='color:%s' href='/page?v=1'>Wetter</a> "
+    "<span style='color:#555'>(Wetter springt nach 10 s zur&uuml;ck)</span></p>"
     "<p style='color:#888;font-size:.8rem;margin-bottom:12px'>"
     "Standort f&uuml;rs Wetter (z.B. 51.5467 / 6.6006): "
     "<form style='display:inline' action='/geo'>"
@@ -934,10 +941,10 @@ void handlePacks(){
          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
          "<meta http-equiv='refresh' content='30'>"
          "<title>Akkupacks</title><style>"
-         "*{box-sizing:border-box;margin:0;padding:0}"
+         "*{box-sizing:border-box;margin:0;padding:0}html{font-size:18px}"
          "body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#eee;"
          "display:flex;justify-content:center;padding:20px}"
-         ".card{background:#1a1a1a;border-radius:16px;padding:24px;width:100%;max-width:560px}"
+         ".card{background:#1a1a1a;border-radius:16px;padding:24px;width:100%;max-width:620px}"
          "h1{font-size:1.25rem;margin-bottom:18px}"
          "h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.09em;"
          "color:#f0a500;margin:20px 0 8px}"
@@ -1076,6 +1083,7 @@ void handlePage(){
   int v=server.arg("v").toInt();
   if(v>=0 && v<PAGES){
     gPage=v;
+    gPageSince=millis();
     lcd.fillScreen(C_BLACK);
     drawDisplay();
     Serial.printf("[LCD] Seite %d\n",v);
@@ -2862,6 +2870,17 @@ void loop(){
     gMqttLastTry=now;
     Serial.println("[MQTT] Getrennt – neuer Versuch");
     mqttConnect();
+  }
+  // Wetterseite laeuft nach 10 s ab - ohne Touch gaebe es sonst keinen
+  // bequemen Weg zurueck zu den Messwerten. Bewusst millis() statt now:
+  // now stammt vom Schleifenanfang, gPageSince wird aber mittendrin in
+  // handlePage() gesetzt und ist dann groesser. Die vorzeichenlose Differenz
+  // wird dabei riesig statt negativ - mit now sprang die Seite sofort zurueck.
+  if(gPage==1 && millis()-gPageSince>=WEATHER_SHOW_MS){
+    gPage=0;
+    lcd.fillScreen(C_BLACK);
+    drawDisplay();
+    Serial.println("[LCD] Wetter vorbei – zurueck auf Messwerte");
   }
   // REST-Abfrage entfaellt – die Daten kommen jetzt per MQTT.
   // Anzeige hoechstens alle 2 s neu zeichnen, sonst flackert es bei 3-s-Daten.
