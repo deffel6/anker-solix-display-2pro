@@ -46,7 +46,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.6.0"
+#define FW_VERSION "2.7.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -258,14 +258,16 @@ static unsigned long gLastEnergySave = 0;
 static WiFiClientSecure gMqttNet;
 static PubSubClient     gMqtt(gMqttNet);
 static float            gOutW          = 0;   // 0xad: Ausgang der Solarbank
-// Hauslast, wie die Solarbank 2 Pro sie in 0xc4 meldet. Der Netzzaehler ist
-// genauer und behaelt den Vorrang; dieser Wert springt ein, wenn keiner da ist.
-static float            gHouseW2       = -1;  // <0 = kein Wert empfangen
 // Letzte Rohwerte des Zaehlers und Herkunft des Teilers. Beides steht in der
 // Weboberflaeche: steht das Geraet bei einem Nutzer, ist ein Bildschirmfoto
 // davon die schnellste Ferndiagnose.
 static uint32_t         gRawImp = 0, gRawExp = 0;
-static bool             gScaleAuto = false;
+// Rohwerte der Solarbank 2 Pro, die in der Weboberflaeche stehen: so laesst
+// sich ein Geraet aus der Ferne pruefen. d3 ist die Ausgangsleistung, c4 ein
+// aehnlicher, noch ungedeuteter Wert (liegt meist 2 W darunter).
+static uint32_t         gRawD3 = 0, gRawC4 = 0;
+// d3 zaehlt in Zehntel-Watt: 5480 waren 548 W, waehrend die App 550 W zeigte.
+#define AUSGANG_TEILER 10
 static uint32_t         gMqttRxCount   = 0;
 static unsigned long    gMqttLastTry   = 0;
 static unsigned long    gMqttConnectedAt = 0; // Startpunkt der Lauschphase
@@ -850,7 +852,8 @@ void handleStatus(){
     "<a style='color:#f0a500' href='/gridscale?v=100'>100</a> &middot; "
     "<a style='color:#f0a500' href='/gridscale?v=1000'>1000</a> "
     "(aktuell %.0f%s)<br>"
-    "<span style='color:#555'>Rohwerte a8=%lu a9=%lu</span></p>"
+    "<span style='color:#555'>Rohwerte a8=%lu a9=%lu"
+    " &middot; Ausgang d3=%lu (c4=%lu)</span></p>"
     "<p style='color:#888;font-size:.8rem;margin-bottom:12px'>"
     "Akkukapazit&auml;t gesamt: "
     "<form style='display:inline' action='/battwh'>"
@@ -925,9 +928,9 @@ void handleStatus(){
     gPvStr[0]+gPvStr[1]+gPvStr[2]+gPvStr[3],
     (gPvWh[0]+gPvWh[1]+gPvWh[2]+gPvWh[3])/1000.0,
     gGridPn.length()?gGridPn.c_str():"Zaehler", gGridScale,
-    gScaleAuto ? " &ndash; selbst bestimmt"
-               : (cfg.gridScale>0 ? " &ndash; von Hand" : ""),
+    cfg.gridScale>0 ? " &ndash; von Hand" : " &ndash; nach Z&auml;hlertyp",
     (unsigned long)gRawImp, (unsigned long)gRawExp,
+    (unsigned long)gRawD3, (unsigned long)gRawC4,
     cfg.battWh, cfg.rotation*90,
     updRow.c_str(),
     bankRow.c_str(),
@@ -1185,7 +1188,6 @@ void handleGridScale(){
   float v=server.arg("v").toFloat();
   if(v>0){
     cfg.gridScale=v; saveConfig(); applyGridScale();
-    gScaleAuto=false;
     Serial.printf("[NETZ] Teiler von Hand auf %.0f gesetzt\n",v);
   }
   server.sendHeader("Location","/"); server.send(302);
@@ -2027,7 +2029,8 @@ static bool parseParamInfo(const String& b64){
   // Zweiter Satz fuer die Solarbank 2 (A17C1): dort sind die Leistungen
   // u32 statt float, die Strings liegen in ca..cd, der Ladestand in ad.
   bool     haveSolar2=false, haveBatt2=false, haveHouse2=false;
-  uint32_t solar2=0, str2[4]={0,0,0,0}, battW2=0, house2=0;
+  bool haveHouse3=false, haveEntl2=false;
+  uint32_t solar2=0, str2[4]={0,0,0,0}, battW2=0, house2=0, house3=0, entl2=0;
   int      soc2=-1;
   String ints;                      // Kandidatenliste fuer den Ladestand
   size_t i=9;                       // 9 Byte Rahmen, dann Felder
@@ -2058,6 +2061,14 @@ static bool parseParamInfo(const String& b64){
         // eine Stunde zuvor stand b0 bei 120 W Solarleistung auf 0.
         case 0xb0: battW2=v; haveBatt2=true; break;
         case 0xc4: house2=v; haveHouse2=true; break;
+        // b7 ist die ENTLADELEISTUNG in Hundertstel-Watt - lange gesucht,
+        // am 22.08.2026 aus einem Mitschnitt am Abend belegt. Beim Laden
+        // steht sie auf 0, dann traegt b0 den Wert.
+        case 0xb7: entl2=v; haveEntl2=true; break;
+        // d3 ist die Ausgangsleistung der Anlage in Zehntel-Watt. Beleg:
+        // d3/10 ergab in jeder geprueften Nachricht auf die Nachkommastelle
+        // genau ab/10 + b7/100, also Solarleistung plus Entladung.
+        case 0xd3: house3=v; haveHouse3=true; break;
         case 0xca: str2[0]=v; break;
         case 0xcb: str2[1]=v; break;
         case 0xcc: str2[2]=v; break;
@@ -2095,8 +2106,16 @@ static bool parseParamInfo(const String& b64){
       if(soc2>=0) soc=soc2;
       // b0 zaehlt in Hundertstel-Watt und kennt nur das Laden. Wo das
       // Entladen steht, ist offen - dafuer fehlt noch ein Log vom Abend.
-      if(haveBatt2) battW=battW2/100.0f;
-      if(haveHouse2) gHouseW2=house2/10.0f;
+      // Laden (b0) und Entladen (b7) kommen getrennt, beide in
+      // Hundertstel-Watt und ohne Vorzeichen. Zusammengefasst gilt wie bei
+      // der 3 Pro: positiv = laden, negativ = entladen.
+      if(haveBatt2 || haveEntl2)
+        battW = (float)battW2/100.0f - (float)entl2/100.0f;
+      if(haveHouse2) gRawC4=house2;
+      if(haveHouse3){
+        gRawD3=house3;
+        outW  = house3/(float)AUSGANG_TEILER;   // Anlagenausgang
+      }
     }
   }
   if(!haveSolar){
@@ -2137,7 +2156,10 @@ static bool parseParamInfo(const String& b64){
   // Ohne Netzzaehler war die Hauslast bisher gar nicht bekannt. Mit Zaehler
   // bleibt dessen Rechnung stehen: sie ist genauer und erfasst auch Verbrauch,
   // den die Solarbank nicht sieht.
-  if(gHouseW2>=0 && gGridSn.isEmpty()) gData.home_w=gHouseW2;
+  // Ohne Zaehler ist der Anlagenausgang die beste Schaetzung fuer den
+  // Hausverbrauch: was die Anlage abgibt, verbraucht das Haus - bis auf das,
+  // was ueber das Netz geht, und genau das misst hier ja niemand.
+  if(gGridSn.isEmpty() && gOutW>0) gData.home_w=gOutW;
   gData.valid=true;
   gHavePower=true;
   for(int k=0;k<4;k++) gPvStr[k]=str[k];
@@ -2165,46 +2187,6 @@ static void applyGridScale(){
   gGridScale = gGridPn.startsWith("SHEM") ? 100.0f : 1.0f;
   Serial.printf("[NETZ] Teiler %.0f (automatisch fuer %s)\n",
                 gGridScale, gGridPn.length()?gGridPn.c_str():"unbekannt");
-}
-
-// ── Teiler des Zaehlers selbst bestimmen ───────────────────────────────────
-// Die Einheit der Rohwerte ist je Zaehler verschieden, und der Produktcode
-// verraet sie nicht zuverlaessig: ein Shelly meldet Hundertstel-Watt, andere
-// ganze Watt. Die Solarbank 2 liefert in 0xc4 aber ihre eigene Hauslast -
-// gegen die App geprueft. Was ueber das Netz laufen muss, ergibt sich daraus:
-// Hauslast minus dem, was die Anlage gerade abgibt (Solar minus Ladeleistung;
-// das Entladen der 2 Pro ist noch nicht dekodiert und zaehlt hier als 0).
-// Das Verhaeltnis zum Rohwert ist dann eine glatte Zehnerpotenz.
-//
-// Bewusst zurueckhaltend: nur wenn niemand den Teiler von Hand gesetzt hat,
-// nur bei Werten deutlich ueber dem Rauschen, nur wenn beide Groessen in
-// dieselbe Richtung zeigen, nur bei einem Verhaeltnis nahe an einer
-// Zehnerpotenz - und erst, wenn fuenf Nachrichten hintereinander dasselbe
-// ergeben haben. Im Zweifel bleibt alles, wie es ist.
-static void autoGridScale(uint32_t imp, uint32_t exp_){
-  if(cfg.gridScale>0) return;             // Handeinstellung hat Vorrang
-  if(gHouseW2<0 || !gHavePower) return;   // ohne 0xc4 keine Vergleichsgroesse
-
-  float erwartet = gHouseW2 - (gData.solar_w - gData.batt_in_w);
-  float roh      = (float)imp - (float)exp_;
-  if(fabsf(erwartet)<50.0f || fabsf(roh)<50.0f) return;
-  if((erwartet>0) != (roh>0)) return;     // Bezug hier, Einspeisung da: nichts tun
-
-  float e = log10f(fabsf(roh/erwartet));
-  float r = roundf(e);
-  if(r<0 || r>3) return;                  // nur 1, 10, 100, 1000
-  if(fabsf(e-r)>0.15f) return;            // zu weit von der Zehnerpotenz weg
-  float cand = powf(10.0f,r);
-
-  static float lastCand=0; static int agree=0;
-  if(cand!=lastCand){ lastCand=cand; agree=1; return; }
-  if(++agree<5) return;
-  if(cand==gGridScale) return;            // steht schon so
-  gGridScale=cand;
-  gScaleAuto=true;
-  Serial.printf("[NETZ] Teiler selbst bestimmt: %.0f "
-                "(Haus %.0f W, PV %.0f W, Laden %.0f W, roh %.0f)\n",
-                gGridScale, gHouseW2, gData.solar_w, gData.batt_in_w, roh);
 }
 
 static bool parseGridInfo(const String& b64){
@@ -2240,7 +2222,6 @@ static bool parseGridInfo(const String& b64){
   if(!have) return false;
 
   gRawImp=imp; gRawExp=exp_;
-  autoGridScale(imp,exp_);
 
   float w=((float)imp-(float)exp_)/gGridScale;
   gData.grid_w=w;

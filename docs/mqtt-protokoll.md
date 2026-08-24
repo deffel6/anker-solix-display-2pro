@@ -144,6 +144,37 @@ Solarbank und Netzzähler benutzen **unterschiedliche Typen für dieselbe Art vo
 Messwert** — die Solarbank `float32`, der Zähler `uint32`. Ein Parser, der nur
 einen davon kennt, findet beim jeweils anderen Gerät gar nichts.
 
+## Solarbank A17C1 (2 Pro) — die belegten Felder
+
+Alle Werte als **u32**, nicht als float32 wie bei der 3 Pro. Belegt am
+22.08.2026 durch einen Mitschnitt am Abend, abgeglichen mit der App.
+
+| Tag | Bedeutung | Einheit | |
+|---|---|---|---|
+| `ab` | Solarleistung gesamt | Zehntel-Watt | ✔ |
+| `ca`–`cd` | die vier PV-Strings, Summe = `ab` | Zehntel-Watt | ✔ |
+| `ad` | Ladestand | Prozent | ✔ |
+| `b0` | **Ladeleistung**, 0 beim Entladen | Hundertstel-Watt | ✔ |
+| `b7` | **Entladeleistung**, 0 beim Laden | Hundertstel-Watt | ✔ |
+| `d3` | **Ausgangsleistung** = `ab` + `b7` | Zehntel-Watt | ✔ |
+| `c4` | ähnlich `d3`, meist 2 W darunter — ungeklärt | Zehntel-Watt | |
+| `c2` | steht auf 800 — vermutlich Einspeisegrenze | Watt | |
+
+Der Beleg für `b7` und `d3` ist eine Summenprobe über vier aufeinanderfolgende
+Nachrichten, jeweils auf die Nachkommastelle genau:
+
+| ab/10 | b7/100 | Summe | d3/10 |
+|---|---|---|---|
+| 24,0 | 524,0 | 548,0 | **548,0** |
+| 24,0 | 522,0 | 546,0 | **546,0** |
+| 24,0 | 519,0 | 543,0 | **543,0** |
+| 24,0 | 521,0 | 545,0 | **545,0** |
+
+Die App zeigte im selben Moment 550 W. Wichtig für die Deutung: `d3` ist
+**nicht** der Hausverbrauch, auch wenn beide Zahlen hier fast gleich sind — der
+Netzfluss betrug nur 1 W. `d3` rechnet die Bank aus ihren eigenen Größen, der
+Hausverbrauch ergibt sich erst mit dem Zählerwert: `d3 + Netz`.
+
 ## Solarbank A17C5 — `param_info`, Typ 0405
 
 Die 749 Byte große Variante. Es gibt eine kürzere mit 425 Byte ohne `0xab`,
