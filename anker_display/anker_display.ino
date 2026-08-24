@@ -46,7 +46,7 @@
   SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
   Copyright (c) 2026 Detlev Euskirchen
 */
-#define FW_VERSION "2.5.0"
+#define FW_VERSION "2.6.0"
 
 // Ausfuehrliche Ausgaben im seriellen Monitor.
 //   1 = jede MQTT-Nachricht wird protokolliert (zum Mitlesen und Decodieren)
@@ -261,6 +261,11 @@ static float            gOutW          = 0;   // 0xad: Ausgang der Solarbank
 // Hauslast, wie die Solarbank 2 Pro sie in 0xc4 meldet. Der Netzzaehler ist
 // genauer und behaelt den Vorrang; dieser Wert springt ein, wenn keiner da ist.
 static float            gHouseW2       = -1;  // <0 = kein Wert empfangen
+// Letzte Rohwerte des Zaehlers und Herkunft des Teilers. Beides steht in der
+// Weboberflaeche: steht das Geraet bei einem Nutzer, ist ein Bildschirmfoto
+// davon die schnellste Ferndiagnose.
+static uint32_t         gRawImp = 0, gRawExp = 0;
+static bool             gScaleAuto = false;
 static uint32_t         gMqttRxCount   = 0;
 static unsigned long    gMqttLastTry   = 0;
 static unsigned long    gMqttConnectedAt = 0; // Startpunkt der Lauschphase
@@ -844,7 +849,8 @@ void handleStatus(){
     "<a style='color:#f0a500' href='/gridscale?v=10'>10</a> &middot; "
     "<a style='color:#f0a500' href='/gridscale?v=100'>100</a> &middot; "
     "<a style='color:#f0a500' href='/gridscale?v=1000'>1000</a> "
-    "(aktuell %.0f)</p>"
+    "(aktuell %.0f%s)<br>"
+    "<span style='color:#555'>Rohwerte a8=%lu a9=%lu</span></p>"
     "<p style='color:#888;font-size:.8rem;margin-bottom:12px'>"
     "Akkukapazit&auml;t gesamt: "
     "<form style='display:inline' action='/battwh'>"
@@ -919,6 +925,9 @@ void handleStatus(){
     gPvStr[0]+gPvStr[1]+gPvStr[2]+gPvStr[3],
     (gPvWh[0]+gPvWh[1]+gPvWh[2]+gPvWh[3])/1000.0,
     gGridPn.length()?gGridPn.c_str():"Zaehler", gGridScale,
+    gScaleAuto ? " &ndash; selbst bestimmt"
+               : (cfg.gridScale>0 ? " &ndash; von Hand" : ""),
+    (unsigned long)gRawImp, (unsigned long)gRawExp,
     cfg.battWh, cfg.rotation*90,
     updRow.c_str(),
     bankRow.c_str(),
@@ -1176,6 +1185,7 @@ void handleGridScale(){
   float v=server.arg("v").toFloat();
   if(v>0){
     cfg.gridScale=v; saveConfig(); applyGridScale();
+    gScaleAuto=false;
     Serial.printf("[NETZ] Teiler von Hand auf %.0f gesetzt\n",v);
   }
   server.sendHeader("Location","/"); server.send(302);
@@ -2157,6 +2167,46 @@ static void applyGridScale(){
                 gGridScale, gGridPn.length()?gGridPn.c_str():"unbekannt");
 }
 
+// ── Teiler des Zaehlers selbst bestimmen ───────────────────────────────────
+// Die Einheit der Rohwerte ist je Zaehler verschieden, und der Produktcode
+// verraet sie nicht zuverlaessig: ein Shelly meldet Hundertstel-Watt, andere
+// ganze Watt. Die Solarbank 2 liefert in 0xc4 aber ihre eigene Hauslast -
+// gegen die App geprueft. Was ueber das Netz laufen muss, ergibt sich daraus:
+// Hauslast minus dem, was die Anlage gerade abgibt (Solar minus Ladeleistung;
+// das Entladen der 2 Pro ist noch nicht dekodiert und zaehlt hier als 0).
+// Das Verhaeltnis zum Rohwert ist dann eine glatte Zehnerpotenz.
+//
+// Bewusst zurueckhaltend: nur wenn niemand den Teiler von Hand gesetzt hat,
+// nur bei Werten deutlich ueber dem Rauschen, nur wenn beide Groessen in
+// dieselbe Richtung zeigen, nur bei einem Verhaeltnis nahe an einer
+// Zehnerpotenz - und erst, wenn fuenf Nachrichten hintereinander dasselbe
+// ergeben haben. Im Zweifel bleibt alles, wie es ist.
+static void autoGridScale(uint32_t imp, uint32_t exp_){
+  if(cfg.gridScale>0) return;             // Handeinstellung hat Vorrang
+  if(gHouseW2<0 || !gHavePower) return;   // ohne 0xc4 keine Vergleichsgroesse
+
+  float erwartet = gHouseW2 - (gData.solar_w - gData.batt_in_w);
+  float roh      = (float)imp - (float)exp_;
+  if(fabsf(erwartet)<50.0f || fabsf(roh)<50.0f) return;
+  if((erwartet>0) != (roh>0)) return;     // Bezug hier, Einspeisung da: nichts tun
+
+  float e = log10f(fabsf(roh/erwartet));
+  float r = roundf(e);
+  if(r<0 || r>3) return;                  // nur 1, 10, 100, 1000
+  if(fabsf(e-r)>0.15f) return;            // zu weit von der Zehnerpotenz weg
+  float cand = powf(10.0f,r);
+
+  static float lastCand=0; static int agree=0;
+  if(cand!=lastCand){ lastCand=cand; agree=1; return; }
+  if(++agree<5) return;
+  if(cand==gGridScale) return;            // steht schon so
+  gGridScale=cand;
+  gScaleAuto=true;
+  Serial.printf("[NETZ] Teiler selbst bestimmt: %.0f "
+                "(Haus %.0f W, PV %.0f W, Laden %.0f W, roh %.0f)\n",
+                gGridScale, gHouseW2, gData.solar_w, gData.batt_in_w, roh);
+}
+
 static bool parseGridInfo(const String& b64){
   size_t need=0;
   mbedtls_base64_decode(nullptr,0,&need,(const uint8_t*)b64.c_str(),b64.length());
@@ -2188,6 +2238,9 @@ static bool parseGridInfo(const String& b64){
     printFieldMap(b, got, 2, "Zaehler,", dumpAll);
   free(b);
   if(!have) return false;
+
+  gRawImp=imp; gRawExp=exp_;
+  autoGridScale(imp,exp_);
 
   float w=((float)imp-(float)exp_)/gGridScale;
   gData.grid_w=w;
